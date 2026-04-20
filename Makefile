@@ -57,22 +57,15 @@ merge: $(COMBINED_UF2)
 # ---- Upload ----------------------------------------------------
 
 upload: $(COMBINED_UF2)
-	@if [ ! -d "$(MOUNT)" ]; then \
-		echo ""; \
-		echo "NICENANO drive not found at $(MOUNT)."; \
-		echo "  --> Double-tap the reset button on the board, then press Enter"; \
-		read dummy; \
-	fi
-	@test -d "$(MOUNT)" || { \
-		echo "ERROR: $(MOUNT) still not found – check the mount path"; exit 1; }
-	@echo "Copying $(COMBINED_UF2) → $(MOUNT)/"
+	@echo "Double-tap reset, then press Enter..."
+	@read dummy
 	cp $(COMBINED_UF2) $(MOUNT)/ && sync
-	@echo "Done. Board should reboot into new firmware."
+	@echo "Done."
 
 # ---- Serial monitor --------------------------------------------
 
 monitor:
-	arduino-cli monitor -p $(PORT) -c baudrate=$(BAUD)
+	while [ 1 ] ; do arduino-cli monitor -p $(PORT) -c baudrate=$(BAUD) ; sleep 1 ; done
 
 # ---- Configure arduino-cli (run once) --------------------------
 

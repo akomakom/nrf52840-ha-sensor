@@ -20,10 +20,10 @@
 #include <bluefruit.h>
 
 // ---- Pin assignments ----------------------------------------
-#define VCC_PIN    17
-#define GND_PIN    20
-#define SCL_PIN    22
-#define SDA_PIN    24
+#define VCC_PIN    24
+#define GND_PIN    22
+#define SCL_PIN    20
+#define SDA_PIN    17
 #define SHT40_ADDR 0x44
 
 // ---- Timing -------------------------------------------------
@@ -232,10 +232,14 @@ void setup() {
   while (!Serial && millis() - t0 < 3000) delay(10);
 
   // BLE init (done once; Advertising is started/stopped each cycle)
+  Bluefruit.autoConnLed(false);     // must be before begin() on some BSP versions
   Bluefruit.begin();
   Bluefruit.setTxPower(8);          // +8 dBm — maximum, best wall penetration
   Bluefruit.setName("NanoTemp");    // shows in HA Bluetooth integration
-  Bluefruit.autoConnLed(false);     // stop the library blinking LED_BUILTIN
+
+  // Hard-take the LED pin so the BSP LED task can't blink it
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   Serial.println("\n=========================================");
   Serial.println("  BTHome Temp/Humidity Sensor  v1.0");

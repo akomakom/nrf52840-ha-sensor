@@ -11,7 +11,7 @@
 #    make help        – show this list
 # ================================================================
 
-SKETCH_NAME := nice_nano_test
+SKETCH_NAME := nrf52840-ha-sensor
 FQBN        := community_nrf52:nrf52:nice_nano
 BUILD_DIR   := .build
 MERGE_SCRIPT:= make_combined_uf2.py

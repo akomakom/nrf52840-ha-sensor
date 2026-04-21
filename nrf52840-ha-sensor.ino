@@ -293,7 +293,7 @@ void loop() {
   // delay() on nRF52840 + SoftDevice calls sd_app_evt_wait(),
   // halting the CPU until the next RTC tick — low quiescent draw.
   Serial.print("Sleeping "); Serial.print(SLEEP_MS / 1000);
-  Serial.println(" s...");
+  Serial.println(" s..!");
   Serial.flush();
   delay(SLEEP_MS);
 }

@@ -1,34 +1,105 @@
 // =============================================================
-//  I2C Pin Finder  (improved)
-//  VCC=pin9, GND=pin10 fixed.
-//  Skips crystal/reserved pins. After address ACK, attempts a
-//  full SHT40 measurement + CRC to eliminate false positives.
+//  BTHome v2 BLE Temperature / Humidity Sensor
+//  nRF52840 (Nice!Nano clone)
+//
+//  SHT40 wiring:  SDA=pin24  SCL=pin22  VCC=pin17  GND=pin20
+//  Protocol:      BTHome v2 — Home Assistant auto-discovery
+//  Sleep:         delay()-based (CPU halted via sd_app_evt_wait,
+//                 ~3-5 µA quiescent). True System-OFF (0.5 µA)
+//                 would require GPIO-triggered wakeup and is a
+//                 future enhancement if battery life needs it.
+//
+//  Telemetry broadcast each cycle:
+//    - Temperature (°C)
+//    - Humidity (%)
+//    - Supply voltage (V)  — measured via SAADC VDD channel
+//    - Battery % estimate  — linear 2×AA: 3.2V=100%, 2.0V=0%
+//                            reads ~100% on USB (VDD = 3.3V)
 // =============================================================
 
-#define VCC_PIN    9
-#define GND_PIN   10
+#include <bluefruit.h>
+
+// ---- Pin assignments ----------------------------------------
+#define VCC_PIN    17
+#define GND_PIN    20
+#define SCL_PIN    22
+#define SDA_PIN    24
 #define SHT40_ADDR 0x44
 
-// Pins to never drive: VCC, GND, USB D+/D-, crystal (P0.00/P0.01 = pins 0/1)
-const uint8_t SKIP[] = { VCC_PIN, GND_PIN, 18,
-                          0, 1,    // XL1/XL2 — 32 kHz crystal, SoftDevice owns them
-                          17, 20   // QSPI / NFC on many variants
-                        };
+// ---- Timing -------------------------------------------------
+#define SLEEP_MS   15000UL   // 15 s (change to 300000UL for 5 min)
+#define ADV_MS      4000     // advertise 4 s per cycle (plenty for HA to catch it)
 
-bool shouldSkip(uint8_t p) {
-  if (p >= 48) return true;
-  for (uint8_t s : SKIP) if (p == s) return true;
-  return false;
+// ---- Diagnostic log (kept in RAM across sleep cycles) -------
+#define LOG_SIZE 8
+static float log_temp[LOG_SIZE];
+static float log_rh[LOG_SIZE];
+static uint8_t log_idx   = 0;
+static uint32_t log_count = 0;
+
+// =============================================================
+// Supply voltage via SAADC VDD channel
+// GAIN=1/6, REFSEL=Internal(0.6V), 12-bit → full scale = 3.6V
+// No external pin or voltage divider required.
+// =============================================================
+
+static float readVDD() {
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled << SAADC_ENABLE_ENABLE_Pos;
+
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit << SAADC_RESOLUTION_VAL_Pos;
+  NRF_SAADC->OVERSAMPLE  = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
+
+  NRF_SAADC->CH[0].CONFIG =
+      (SAADC_CH_CONFIG_GAIN_Gain1_6    << SAADC_CH_CONFIG_GAIN_Pos)   |
+      (SAADC_CH_CONFIG_MODE_SE         << SAADC_CH_CONFIG_MODE_Pos)   |
+      (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+      (SAADC_CH_CONFIG_RESN_Bypass     << SAADC_CH_CONFIG_RESN_Pos)   |
+      (SAADC_CH_CONFIG_RESP_Bypass     << SAADC_CH_CONFIG_RESP_Pos)   |
+      (SAADC_CH_CONFIG_TACQ_40us       << SAADC_CH_CONFIG_TACQ_Pos);
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_VDD << SAADC_CH_PSELP_PSELP_Pos;
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC  << SAADC_CH_PSELN_PSELN_Pos;
+
+  volatile int16_t result = 0;
+  NRF_SAADC->RESULT.PTR    = (uint32_t)&result;
+  NRF_SAADC->RESULT.MAXCNT = 1;
+
+  NRF_SAADC->TASKS_START = 1;
+  while (!NRF_SAADC->EVENTS_STARTED) {}
+  NRF_SAADC->EVENTS_STARTED = 0;
+
+  NRF_SAADC->TASKS_SAMPLE = 1;
+  while (!NRF_SAADC->EVENTS_END) {}
+  NRF_SAADC->EVENTS_END = 0;
+
+  NRF_SAADC->TASKS_STOP = 1;
+  while (!NRF_SAADC->EVENTS_STOPPED) {}
+  NRF_SAADC->EVENTS_STOPPED = 0;
+
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Disabled << SAADC_ENABLE_ENABLE_Pos;
+
+  if (result < 0) result = 0;
+  return (float)result * 3.6f / 4096.0f;
 }
 
-// ---- Bit-bang I2C -------------------------------------------
-uint8_t g_sda, g_scl;
+// Estimate battery % for 2×AA alkaline (direct / unregulated).
+// Returns 100 when on USB (VDD ≈ 3.3V regulated).
+static uint8_t voltToPercent(float vdd) {
+  const float V_FULL = 3.2f;   // 2 × 1.60V — fresh alkaline
+  const float V_EMPTY = 2.0f;  // 2 × 1.00V — effectively dead
+  if (vdd >= V_FULL)  return 100;
+  if (vdd <= V_EMPTY) return 0;
+  return (uint8_t)(100.0f * (vdd - V_EMPTY) / (V_FULL - V_EMPTY));
+}
 
-static void sdaH() { pinMode(g_sda, INPUT_PULLUP); }
-static void sdaL() { pinMode(g_sda, OUTPUT); digitalWrite(g_sda, LOW); }
-static void sclH() { pinMode(g_scl, INPUT_PULLUP); }
-static void sclL() { pinMode(g_scl, OUTPUT); digitalWrite(g_scl, LOW); }
-static bool sdaR() { pinMode(g_sda, INPUT_PULLUP); return digitalRead(g_sda); }
+// =============================================================
+// Bit-bang I2C
+// =============================================================
+
+static void sdaH() { pinMode(SDA_PIN, INPUT_PULLUP); }
+static void sdaL() { pinMode(SDA_PIN, OUTPUT); digitalWrite(SDA_PIN, LOW); }
+static void sclH() { pinMode(SCL_PIN, INPUT_PULLUP); }
+static void sclL() { pinMode(SCL_PIN, OUTPUT); digitalWrite(SCL_PIN, LOW); }
+static bool sdaR() { pinMode(SDA_PIN, INPUT_PULLUP); return digitalRead(SDA_PIN); }
 static void d()    { delayMicroseconds(5); }
 
 static void bbStart() { sdaH();d(); sclH();d(); sdaL();d(); sclL();d(); }
@@ -69,125 +140,156 @@ static uint8_t crc8(uint8_t *data, int len) {
   return crc;
 }
 
-static void releasePins(uint8_t sda, uint8_t scl) {
-  pinMode(sda, INPUT); pinMode(scl, INPUT);
-}
-
-// Returns true if SHT40 ACKs the address
-static bool probeAddr(uint8_t sda, uint8_t scl) {
-  g_sda = sda; g_scl = scl;
+// Returns true and fills tempC/rh on success
+static bool readSHT40(float &tempC, float &rh) {
   bbStart();
-  bool ack = bbWrite(SHT40_ADDR << 1);
-  bbStop();
-  releasePins(sda, scl);
-  return ack;
-}
-
-// After address ACK: send measure command, read 6 bytes, check CRC
-// Returns true only if we get valid temperature data
-static bool verifyMeasurement(uint8_t sda, uint8_t scl) {
-  g_sda = sda; g_scl = scl;
-
-  // Send measure command 0xFD (high precision)
-  bbStart();
-  if (!bbWrite(SHT40_ADDR << 1)) { bbStop(); releasePins(sda, scl); return false; }
-  if (!bbWrite(0xFD))            { bbStop(); releasePins(sda, scl); return false; }
+  if (!bbWrite(SHT40_ADDR << 1)) { bbStop(); return false; }
+  if (!bbWrite(0xFD))            { bbStop(); return false; }  // high-precision measure
   bbStop();
 
-  delay(10);  // measurement time
+  delay(10);  // ~8.3 ms conversion time
 
-  // Read 6 bytes
   bbStart();
-  if (!bbWrite((SHT40_ADDR << 1) | 1)) { bbStop(); releasePins(sda, scl); return false; }
+  if (!bbWrite((SHT40_ADDR << 1) | 1)) { bbStop(); return false; }
   uint8_t buf[6];
   for (int i = 0; i < 6; i++) buf[i] = bbRead(i < 5);
   bbStop();
-  releasePins(sda, scl);
 
-  // Check both CRCs
-  if (crc8(buf, 2) != buf[2])   return false;
+  if (crc8(buf, 2)   != buf[2]) return false;
   if (crc8(buf+3, 2) != buf[5]) return false;
 
-  // Sanity-check temperature: must be between -20 and +85 C
-  uint16_t t_raw = ((uint16_t)buf[0] << 8) | buf[1];
-  float tempC = -45.0f + 175.0f * (float)t_raw / 65535.0f;
-  if (tempC < -20.0f || tempC > 85.0f) return false;
-
+  uint16_t t_raw  = ((uint16_t)buf[0] << 8) | buf[1];
+  uint16_t rh_raw = ((uint16_t)buf[3] << 8) | buf[4];
+  tempC = -45.0f + 175.0f * (float)t_raw  / 65535.0f;
+  rh    =  -6.0f + 125.0f * (float)rh_raw / 65535.0f;
+  rh    = constrain(rh, 0.0f, 100.0f);
   return true;
+}
+
+// =============================================================
+// BTHome v2 advertisement
+//
+// Service UUID:   0xFCD2
+// Device info:    0x40  (version=2, no encryption, not trigger-based)
+// Object 0x02:    temperature, sint16, factor 0.01 °C
+// Object 0x03:    humidity,   uint16, factor 0.01 %
+// =============================================================
+
+static void doAdvertise(float tempC, float rh, float vdd, uint8_t batPct) {
+  int16_t  t_enc = (int16_t)(tempC * 100.0f);
+  uint16_t h_enc = (uint16_t)(rh   * 100.0f);
+  uint16_t v_enc = (uint16_t)(vdd  * 1000.0f);  // millivolts (factor 0.001 V)
+
+  // AD type 0x16 = Service Data – 16-bit UUID
+  // BTHome v2 objects (must be sorted by object ID):
+  //   0x01  battery %    uint8
+  //   0x02  temperature  sint16  × 0.01 °C
+  //   0x03  humidity     uint16  × 0.01 %
+  //   0x0C  voltage      uint16  × 0.001 V
+  uint8_t svc[] = {
+    0xD2, 0xFC,                              // UUID 0xFCD2 little-endian
+    0x40,                                    // BTHome v2, no encryption
+    0x01,                                    // battery %
+    batPct,
+    0x02,                                    // temperature
+    (uint8_t)( t_enc        & 0xFF),
+    (uint8_t)((t_enc >> 8)  & 0xFF),
+    0x03,                                    // humidity
+    (uint8_t)( h_enc        & 0xFF),
+    (uint8_t)((h_enc >> 8)  & 0xFF),
+    0x0C,                                    // voltage
+    (uint8_t)( v_enc        & 0xFF),
+    (uint8_t)((v_enc >> 8)  & 0xFF)
+  };
+
+  Bluefruit.Advertising.clearData();
+  Bluefruit.ScanResponse.clearData();
+
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addData(0x16, svc, sizeof(svc));
+  Bluefruit.ScanResponse.addName();
+
+  // 20 ms interval → HA will receive several copies during ADV_MS window
+  Bluefruit.Advertising.setInterval(32, 32);  // 32 × 0.625 ms = 20 ms
+  Bluefruit.Advertising.setFastTimeout(0);    // stay in fast mode until stopped
+
+  Bluefruit.Advertising.start(0);             // start (0 = no auto-stop)
+  delay(ADV_MS);
+  Bluefruit.Advertising.stop();
 }
 
 // =============================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
 
+  // Sensor power
   pinMode(GND_PIN, OUTPUT); digitalWrite(GND_PIN, LOW);
   pinMode(VCC_PIN, OUTPUT); digitalWrite(VCC_PIN, HIGH);
   delay(10);
 
   uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 5000) delay(10);
+  while (!Serial && millis() - t0 < 3000) delay(10);
+
+  // BLE init (done once; Advertising is started/stopped each cycle)
+  Bluefruit.begin();
+  Bluefruit.setTxPower(8);          // +8 dBm — maximum, best wall penetration
+  Bluefruit.setName("NanoTemp");    // shows in HA Bluetooth integration
+  Bluefruit.autoConnLed(false);     // stop the library blinking LED_BUILTIN
 
   Serial.println("\n=========================================");
-  Serial.println("  I2C Pin Finder  (SHT40 @ 0x44)");
-  Serial.println("  VCC=pin9, GND=pin10");
-  Serial.println("  Skipping: 0,1 (crystal), 9,10,18");
-  Serial.println("  ACK candidate verified by full CRC read");
+  Serial.println("  BTHome Temp/Humidity Sensor  v1.0");
+  Serial.print(  "  Interval : "); Serial.print(SLEEP_MS / 1000); Serial.println(" s");
+  Serial.print(  "  Advertise: "); Serial.print(ADV_MS   / 1000); Serial.println(" s/cycle");
+  Serial.println("  BLE name  : NanoTemp");
+  Serial.println("  In HA: Settings → Devices → Bluetooth");
   Serial.println("=========================================\n");
   Serial.flush();
 }
 
 void loop() {
-  bool found = false;
-  uint8_t foundSDA = 0, foundSCL = 0;
+  // ---- Power on sensor --------------------------------------
+  digitalWrite(VCC_PIN, HIGH);
+  delay(10);  // SHT40 power-up time
 
-  for (uint8_t sda = 0; sda < 48 && !found; sda++) {
-    if (shouldSkip(sda)) continue;
-    for (uint8_t scl = 0; scl < 48 && !found; scl++) {
-      if (shouldSkip(scl) || scl == sda) continue;
+  // ---- Read sensor + supply voltage -------------------------
+  float tempC, rh;
+  bool ok = readSHT40(tempC, rh);
+  float vdd    = readVDD();
+  uint8_t bat  = voltToPercent(vdd);
 
-      if (probeAddr(sda, scl)) {
-        Serial.print("  ACK at SDA="); Serial.print(sda);
-        Serial.print(" SCL="); Serial.print(scl);
-        Serial.print(" — verifying...");
-        Serial.flush();
+  if (ok) {
+    // Append to diagnostic log
+    log_temp[log_idx] = tempC;
+    log_rh[log_idx]   = rh;
+    log_idx = (log_idx + 1) % LOG_SIZE;
+    log_count++;
 
-        if (verifyMeasurement(sda, scl)) {
-          Serial.println(" CONFIRMED!");
-          foundSDA = sda; foundSCL = scl;
-          found = true;
-        } else {
-          Serial.println(" false positive, skipping");
-          Serial.flush();
-        }
-      }
-    }
-
-    if (!found && sda % 8 == 7) {
-      Serial.print("  Tried SDA up to pin "); Serial.println(sda);
-      Serial.flush();
-    }
-  }
-
-  if (!found) {
-    Serial.println("No SHT40 found in this pass. Retrying...\n");
+    float tempF = tempC * 9.0f / 5.0f + 32.0f;
+    Serial.print("["); Serial.print(log_count); Serial.print("]  ");
+    Serial.print(tempC, 2); Serial.print(" C / ");
+    Serial.print(tempF, 2); Serial.print(" F   RH:");
+    Serial.print(rh, 1);   Serial.print(" %   VDD:");
+    Serial.print(vdd, 3);  Serial.print(" V   BAT:");
+    Serial.print(bat);     Serial.println(" %");
     Serial.flush();
-    delay(2000);
+
+    // ---- Advertise -----------------------------------------
+    doAdvertise(tempC, rh, vdd, bat);
+
   } else {
-    // Keep printing so monitor can open late
-    while (true) {
-      Serial.println("*** SHT40 CONFIRMED ***");
-      Serial.print("  SDA = pin "); Serial.print(foundSDA);
-      Serial.print("  (P"); Serial.print(foundSDA/32); Serial.print('.');
-      if (foundSDA%32 < 10) Serial.print('0'); Serial.print(foundSDA%32); Serial.println(")");
-      Serial.print("  SCL = pin "); Serial.print(foundSCL);
-      Serial.print("  (P"); Serial.print(foundSCL/32); Serial.print('.');
-      if (foundSCL%32 < 10) Serial.print('0'); Serial.print(foundSCL%32); Serial.println(")");
-      Serial.flush();
-      pinMode(LED_BUILTIN, OUTPUT);
-      digitalWrite(LED_BUILTIN, HIGH); delay(500);
-      digitalWrite(LED_BUILTIN, LOW);  delay(500);
-    }
+    Serial.println("ERROR: SHT40 read failed — skipping advertisement");
+    Serial.flush();
   }
+
+  // ---- Power off sensor for sleep ---------------------------
+  digitalWrite(VCC_PIN, LOW);
+
+  // ---- Sleep ------------------------------------------------
+  // delay() on nRF52840 + SoftDevice calls sd_app_evt_wait(),
+  // halting the CPU until the next RTC tick — low quiescent draw.
+  Serial.print("Sleeping "); Serial.print(SLEEP_MS / 1000);
+  Serial.println(" s...");
+  Serial.flush();
+  delay(SLEEP_MS);
 }

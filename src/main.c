@@ -209,43 +209,8 @@ static int diag_post_90(void) { diag_flash_on(5); return 0; }
  * 6 blinks = those inits survived.  No 6-blinks = crash is inside priority-90 inits. */
 static int diag_post_91(void) { diag_flash_on(6); return 0; }
 
-/* Priority 92: USB CDC ACM is now registered (done at priority 90).
- * Hold here so the host can enumerate ttyACM0 and the user can open a
- * serial terminal before nrf5_init runs at priority 95.
- *
- * LED pattern (unmistakable even after solid-on from diag_post_91):
- *   1. LED OFF for 1 second  — clear break from solid
- *   2. 10 rapid blinks (200 ms on / 200 ms off) — "waiting" signal
- *   3. Slow breathe (500 ms on / 500 ms off) for 15 s — open serial now!
- */
-static int diag_usb_wait(void)
-{
-	diag_pet_wdt();
-
-	/* Phase 1: LED OFF for 1 s — unmistakable break from solid */
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-	k_busy_wait(500000); diag_pet_wdt();
-	k_busy_wait(500000); diag_pet_wdt();
-
-	/* Phase 2: 10 rapid blinks — "I'm alive and waiting" */
-	for (int i = 0; i < 10; i++) {
-		nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(200000);
-		nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(200000);
-		diag_pet_wdt();
-	}
-
-	/* Phase 3: slow breathe for 15 s — "open serial terminal NOW" */
-	for (int i = 0; i < 15; i++) {
-		nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(500000); diag_pet_wdt();
-		nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(500000); diag_pet_wdt();
-	}
-
-	return 0;
-}
+/* Priority 92: diagnostic complete — USB CDC is up, proceed to boot. */
+static int diag_usb_wait(void) { diag_pet_wdt(); return 0; }
 
 static int diag_post_95(void) { diag_flash_on(7); return 0; }
 
@@ -268,6 +233,11 @@ SYS_INIT(diag_post_95, POST_KERNEL, 95);
 #include <zigbee/zigbee_app_utils.h>
 #include <zigbee/zigbee_error_handler.h>
 #include <zb_nrf_platform.h>        /* zigbee_enable() */
+
+/* zb_bdb_reset_via_local_action is exported from the prebuilt libzboss.a
+ * but not declared in any public header in NCS 2.7.  It is used the same
+ * way inside zigbee_app_utils.c (the NCS factory-reset implementation). */
+extern void zb_bdb_reset_via_local_action(zb_uint8_t param);
 
 /* ZCL cluster headers */
 #include <zcl/zb_zcl_basic.h>
@@ -313,7 +283,7 @@ static const struct adc_dt_spec adc_vdd =
 #define SENSOR_ENDPOINT          1
 #define SENSOR_IN_CLUSTER_COUNT  4
 #define SENSOR_OUT_CLUSTER_COUNT 0
-#define SENSOR_REPORT_COUNT      2   /* temperature + humidity */
+#define SENSOR_REPORT_COUNT      4   /* temp + humidity + batt% + batt voltage */
 
 /* ZHA Temperature Sensor device ID */
 #define SENSOR_DEVICE_ID  0x0302u
@@ -324,8 +294,10 @@ static const struct adc_dt_spec adc_vdd =
 /* ── ZCL attribute storage ───────────────────────────────────────── */
 
 /* Basic cluster */
-static zb_uint8_t attr_zcl_version  = ZB_ZCL_VERSION;
-static zb_uint8_t attr_power_source = ZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
+static zb_uint8_t attr_zcl_version    = ZB_ZCL_VERSION;
+static zb_uint8_t attr_power_source   = ZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
+static char       attr_manufacturer[] = "DIY";
+static char       attr_model[]        = "TempHumSensor";
 
 /* Power Config cluster
  *   voltage    : 100 mV units  (30 → 3.0 V)
@@ -347,9 +319,15 @@ static zb_uint16_t attr_hum_max_value = 10000;
 
 /* ── Attribute lists ─────────────────────────────────────────────── */
 
-ZB_ZCL_DECLARE_BASIC_ATTRIB_LIST(basic_attr_list,
-	&attr_zcl_version,
-	&attr_power_source);
+/* Declare only the attributes we have values for — ZHA reads what's
+ * available and skips the rest.  Avoids NULL-pointer dereferences from
+ * the _EXT macro's full list. */
+ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(basic_attr_list, ZB_ZCL_BASIC)
+ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_ZCL_VERSION_ID,        &attr_zcl_version)
+ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID,   attr_manufacturer)
+ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,    attr_model)
+ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID,       &attr_power_source)
+ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
 /*
  * Power Config: build manually with ZB_ZCL_SET_ATTR_DESC_M to avoid
@@ -360,7 +338,7 @@ ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(power_config_attr_list,
 ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
 			&attr_batt_voltage,
 			ZB_ZCL_ATTR_TYPE_U8,
-			ZB_ZCL_ATTR_ACCESS_READ_ONLY)
+			ZB_ZCL_ATTR_ACCESS_READ_ONLY | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
 			&attr_batt_percentage,
 			ZB_ZCL_ATTR_TYPE_U8,
@@ -454,8 +432,30 @@ static struct adc_sequence adc_seq = {
 	.buffer_size = sizeof(adc_raw_val),
 };
 
-/* ── Forward declaration ─────────────────────────────────────────── */
+/* ── Forward declarations ────────────────────────────────────────── */
 static void measure_and_report(zb_uint8_t param);
+static void restore_long_poll(zb_uint8_t param);
+static void on_network_joined(void);
+
+/* After joining, poll every 2 s for 60 s so ZHA can complete its
+ * attribute interview, then restore the normal 15-second sleep cycle. */
+static void on_network_joined(void)
+{
+	zb_zdo_pim_set_long_poll_interval(2000);
+	ZB_SCHEDULE_APP_ALARM_CANCEL(restore_long_poll, ZB_ALARM_ANY_PARAM);
+	ZB_SCHEDULE_APP_ALARM(restore_long_poll, 0,
+			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(60000));
+	ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report, ZB_ALARM_ANY_PARAM);
+	ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
+			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
+}
+
+static void restore_long_poll(zb_uint8_t param)
+{
+	ARG_UNUSED(param);
+	zb_zdo_pim_set_long_poll_interval(15000);
+	LOG_INF("Interview window closed — poll interval 15 s");
+}
 
 /* ── Battery measurement ─────────────────────────────────────────── */
 
@@ -567,30 +567,55 @@ void zboss_signal_handler(zb_bufid_t bufid)
 
 	switch (sig) {
 	case ZB_BDB_SIGNAL_DEVICE_FIRST_START:
+		/* ZBOSS initialized with empty NVRAM — default handler starts
+		 * network steering.  Do NOT start measurements yet. */
+		LOG_INF("First start — beginning network steering");
+		break;
+
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
+		/* Reboot with existing network credentials in NVRAM. */
 		if (status == RET_OK) {
-			LOG_INF("Zigbee network joined — starting measurements");
-			/* Align long-poll interval with measurement cadence */
+			/* Rejoined old network — go straight to normal sleep
+			 * cycle; ZHA already interviewed us on first join. */
+			LOG_INF("Rejoined network — starting measurements");
 			zb_zdo_pim_set_long_poll_interval(15000);
 			ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report,
 						     ZB_ALARM_ANY_PARAM);
 			ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
 				ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
 		} else {
-			LOG_INF("Joining Zigbee network...");
+			/* The network we were on is gone (coordinator reset,
+			 * ZHA removed us, etc.).  Wipe NVRAM so the next boot
+			 * starts a clean steer; ZHA can then discover us fresh.
+			 *
+			 * Without this, ZBOSS spends time on a fruitless rejoin
+			 * attempt on every boot before falling through to steering
+			 * — burning through ZHA's permit-join window and making
+			 * the device appear unfindable.
+			 *
+			 * zb_bdb_reset_via_local_action clears NVRAM and triggers
+			 * a new DEVICE_FIRST_START on the next stack run. */
+			LOG_WRN("Rejoin failed — clearing Zigbee NVRAM via BDB reset");
+			ZB_SCHEDULE_APP_CALLBACK(zb_bdb_reset_via_local_action, 0);
 		}
 		break;
 
 	case ZB_BDB_SIGNAL_STEERING:
 		if (status == RET_OK) {
-			LOG_INF("Network steering OK — starting measurements");
-			zb_zdo_pim_set_long_poll_interval(15000);
-			ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report,
-						     ZB_ALARM_ANY_PARAM);
-			ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
-				ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
+			/* Joined a network for the first time (or after loss).
+			 * Use a fast poll interval for the 60-second window
+			 * so ZHA can complete its attribute interview. */
+			LOG_INF("Network steering OK — starting interview window");
+			on_network_joined();
 		} else {
-			LOG_WRN("Network steering failed (status %d)", status);
+			/* Steering attempt timed out — ZHA wasn't in permit-join
+			 * mode or didn't hear us.  The default handler retries with
+			 * exponential back-off; we just log here.
+			 *
+			 * Do NOT call user_input_indicate() here: it contains an
+			 * internal ZB_ERROR_CHECK that resets the device if the
+			 * scheduler queue is momentarily full. */
+			LOG_WRN("Steering attempt failed — will retry");
 		}
 		break;
 
@@ -601,12 +626,40 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		break;
 
 	default:
+		/* Log unhandled signals so we can see the full ZBOSS event stream */
+		LOG_INF("Zigbee signal 0x%x status %d (unhandled)", (unsigned)sig, (int)status);
 		break;
 	}
 
-	/* Default handler manages steering restarts, buffer freeing, etc. */
-	ZB_ERROR_CHECK(zigbee_default_signal_handler(bufid));
+	/* Call WITHOUT ZB_ERROR_CHECK.  If the default handler's internal
+	 * callback queue is momentarily full it returns a non-RET_OK value,
+	 * ZB_ERROR_CHECK would trigger a ZBOSS assert, and with
+	 * ZBOSS_RESET_ON_ASSERT=y the device resets — creating an infinite
+	 * steering-fail → reset loop.  Failures here are non-fatal; the
+	 * handler will be called again on the next signal. */
+	zigbee_default_signal_handler(bufid);
+
+	/* CRITICAL: return the buffer to the ZBOSS pool after the default
+	 * handler is done with it.  Without this, every Zigbee signal leaks
+	 * one buffer.  After a handful of signals the pool is exhausted and
+	 * bdb_start_top_level_commissioning() returns ZB_FALSE — silently
+	 * refusing to start the channel scan — so ZB_BDB_SIGNAL_STEERING
+	 * never fires and ZHA cannot discover the device. */
+	if (bufid) {
+		zb_buf_free(bufid);
+	}
 }
+
+/* ── WDT keepalive ───────────────────────────────────────────────── */
+/* The Adafruit bootloader starts a 1-second hardware WDT that cannot be
+ * stopped.  Feed it every 500 ms from a kernel timer so the app never
+ * accidentally resets during normal operation. */
+static void wdt_keepalive_cb(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	diag_pet_wdt();
+}
+static K_TIMER_DEFINE(wdt_keepalive_timer, wdt_keepalive_cb, NULL);
 
 /* ── main ────────────────────────────────────────────────────────── */
 
@@ -614,11 +667,14 @@ int main(void)
 {
 	int err;
 
+	/* Start WDT keepalive immediately — must feed within 1 s or reset */
+	k_timer_start(&wdt_keepalive_timer, K_MSEC(500), K_MSEC(500));
+
 	/* Diagnostic: turn LED off to signal main() was reached */
 	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
 
 	/* Give USB CDC time to enumerate so early log output is captured. */
-	k_sleep(K_SECONDS(3));
+	k_sleep(K_MSEC(500));
 	LOG_INF("Sensor app starting");
 
 	/* ── Verify devices are ready ── */
@@ -663,6 +719,15 @@ int main(void)
 	/* Enable sleepy end device behavior (radio off between polls).
 	 * Must be called before zigbee_enable(). */
 	zigbee_configure_sleepy_behavior(true);
+
+	/* DEV: erase Zigbee NVRAM on every boot so the device always starts
+	 * factory-new and goes straight to DEVICE_FIRST_START → steering.
+	 * This avoids DEVICE_REBOOT attempting to rejoin a stale network and
+	 * burning through ZHA's permit-join window before steering begins.
+	 *
+	 * NOTE: remove (or gate on a compile flag) before production — without
+	 * this the device will re-pair on every reset instead of rejoining. */
+	zigbee_erase_persistent_storage(ZB_TRUE);
 
 	zigbee_enable();
 

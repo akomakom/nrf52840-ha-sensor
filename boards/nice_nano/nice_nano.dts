@@ -1,0 +1,103 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * nice!nano (nRF52840) — Chinese clone / keyboard board
+ * Adafruit nRF52 UF2 bootloader v0.4.1 (s140_6.1.1)
+ * App start: 0x26000  (hardcoded in bootloader for s140 devices)
+ */
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include "nice_nano-pinctrl.dtsi"
+
+/ {
+	model = "nice!nano";
+	compatible = "nicekeyboards,nice-nano";
+
+	chosen {
+		zephyr,console      = &usb_cdc_acm_uart;
+		zephyr,shell-uart   = &usb_cdc_acm_uart;
+		zephyr,sram         = &sram0;
+		zephyr,flash        = &flash0;
+		zephyr,code-partition = &code_partition;
+		zephyr,ieee802154   = &ieee802154;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		blue_led: led_0 {
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+			label = "Blue LED";
+		};
+	};
+
+	aliases {
+		led0      = &blue_led;
+		watchdog0 = &wdt0;
+	};
+};
+
+&adc {
+	status = "okay";
+};
+
+&uicr {
+	gpio-as-nreset;
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&ieee802154 {
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* Space reserved for MBR + SoftDevice-compatible region.
+		 * Zephyr does not use SoftDevice; this is just reserved
+		 * to match the bootloader's hardcoded app start at 0x26000. */
+		sd_partition: partition@0 {
+			label = "softdevice";
+			reg = <0x00000000 0x00026000>;
+		};
+
+		code_partition: partition@26000 {
+			label = "code_partition";
+			reg = <0x00026000 0x000c6000>;
+		};
+
+		/* FCB / LittleFS / NVS storage */
+		storage_partition: partition@ec000 {
+			label = "storage";
+			reg = <0x000ec000 0x00008000>;
+		};
+
+		/* Adafruit UF2 bootloader */
+		boot_partition: partition@f4000 {
+			label = "adafruit_boot";
+			reg = <0x000f4000 0x0000c000>;
+		};
+	};
+};
+
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+
+	usb_cdc_acm_uart: cdc-acm-uart {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

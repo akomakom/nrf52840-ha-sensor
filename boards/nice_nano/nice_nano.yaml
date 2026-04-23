@@ -1,0 +1,17 @@
+identifier: nice_nano
+name: nice!nano
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+  - gnuarmemb
+supported:
+  - adc
+  - gpio
+  - i2c
+  - usb_cdc
+  - usb_device
+  - ieee802154
+vendor: nicekeyboards

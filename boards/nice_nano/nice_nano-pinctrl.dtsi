@@ -1,0 +1,8 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * nice!nano pin control — add peripheral pinctrl here as needed
+ */
+
+&pinctrl {
+	/* Placeholder — I2C and other peripherals configured via app.overlay */
+};

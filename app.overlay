@@ -1,0 +1,63 @@
+/*
+ * nice!nano — application overlay
+ *
+ * I2C0 (TWIM0):  SDA = P0.17   SCL = P0.20
+ * SHT40:         I2C addr 0x44, powered via GPIO (VCC=P0.24, GND=P0.22)
+ * ADC channel 0: internal VDD via SAADC (GAIN=1/6, REF=0.6 V, 12-bit)
+ */
+
+#include <zephyr/dt-bindings/adc/nrf-adc.h>
+
+/* ── I2C pinctrl ──────────────────────────────────────────────────── */
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
+			        <NRF_PSEL(TWIM_SCL, 0, 20)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
+			        <NRF_PSEL(TWIM_SCL, 0, 20)>;
+			low-power-enable;
+		};
+	};
+};
+
+/* ── I2C0 + SHT40 ─────────────────────────────────────────────────── */
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+
+	sht40: sht4x@44 {
+		compatible = "sensirion,sht4x";
+		reg = <0x44>;
+		repeatability = <2>;   /* high repeatability */
+	};
+};
+
+/* ── ADC channel 0: VDD (internal) ───────────────────────────────── */
+/ {
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain             = "ADC_GAIN_1_6";
+		zephyr,reference        = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive   = <NRF_SAADC_VDD>;
+		zephyr,resolution       = <12>;
+	};
+};

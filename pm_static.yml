@@ -1,0 +1,36 @@
+# Static partition map for nice!nano (Adafruit UF2 bootloader)
+#
+# PM_SINGLE_IMAGE (auto-selected by CONFIG_ZIGBEE) hands flash layout to the
+# Partition Manager.  Without this file PM links the app at VMA 0x0, but the
+# Adafruit bootloader hardcodes the app start at 0x26000 — the reset vector
+# points into bootloader space and the CPU hard-faults immediately.
+#
+# PM requires exactly ONE gap in the static table so it can place 'app'
+# dynamically.  We fill both ends of flash, leaving only 0x26000–0xa6000:
+#
+#   0x000000–0x025FFF  boot_reserved  (MBR / SoftDevice-compat area, 152 KB)
+#   0x026000–0x0A5FFF  [gap → PM places 'app' here, 512 KB]
+#   0x0A6000–0x0ADFFF  zboss_nvram        (32 KB)
+#   0x0AE000–0x0AEFFF  zboss_product_config (4 KB)
+#   0x0AF000–0x0B0FFF  settings_storage   (8 KB)
+#   0x0B1000–0x0FFFFF  adafruit_boot      (316 KB — unused gap + 48 KB BL)
+
+boot_reserved:
+  address: 0x0
+  size: 0x26000
+
+zboss_nvram:
+  address: 0xa6000
+  size: 0x8000
+
+zboss_product_config:
+  address: 0xae000
+  size: 0x1000
+
+settings_storage:
+  address: 0xaf000
+  size: 0x2000
+
+adafruit_boot:
+  address: 0xb1000
+  size: 0x4f000

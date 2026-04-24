@@ -19,6 +19,7 @@ BOARD     := nice_nano/nrf52840
 BUILD_DIR := build
 PORT      := /dev/ttyACM0
 BAUD      := 115200
+VENV			:= ~/ncs/.venv
 
 UF2 := $(BUILD_DIR)/zephyr/zephyr.uf2
 
@@ -40,8 +41,20 @@ all: build
 # (incremental no-op), the flash step will fail loudly instead of
 # copying a stale file.
 
-build:
+$(VENV):
+	python3 -m venv $(VENV)
+	source $(VENV)/bin/activate
+	pip3 install -r requirements.txt
+	@echo It is advisable to activate the venv in the current shell for interactive debugging:
+	@echo source $(VENV)/bin/activate
+
+
+_check_venv:
+	test -d $(VENV) || $(MAKE) bootstrap
+
+build: $(VENV)
 	@rm -f $(UF2)
+	source $(VENV)/bin/activate
 	west build -b $(BOARD) -d $(BUILD_DIR)
 	@test -f $(UF2) || { echo "ERROR: build finished but $(UF2) was not produced!"; exit 1; }
 

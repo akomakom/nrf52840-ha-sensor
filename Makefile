@@ -48,14 +48,9 @@ $(VENV):
 	@echo It is advisable to activate the venv in the current shell for interactive debugging:
 	@echo source $(VENV)/bin/activate
 
-
-_check_venv:
-	test -d $(VENV) || $(MAKE) bootstrap
-
 build: $(VENV)
 	@rm -f $(UF2)
-	source $(VENV)/bin/activate
-	west build -b $(BOARD) -d $(BUILD_DIR)
+	source $(VENV)/bin/activate && west build -b $(BOARD) -d $(BUILD_DIR)
 	@test -f $(UF2) || { echo "ERROR: build finished but $(UF2) was not produced!"; exit 1; }
 
 # ---- Flash -----------------------------------------------------

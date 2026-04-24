@@ -85,12 +85,16 @@ monitor:
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Erase only the Zigbee NVRAM / NVS storage partition (0xec000, 32 KB).
+# Erase Zigbee NVRAM + settings so the device forgets its network credentials.
 # Does NOT touch firmware.  Requires nrfjprog (J-Link tools).
 # Use this if the device is stuck in a rejoin loop with stale credentials.
-# Note: make pflash does NOT erase NVRAM — it only writes the code partition.
+#
+# Partition layout (from pm_static.yml):
+#   0xa6000–0xadfff  zboss_nvram        (32 KB)
+#   0xae000–0xaefff  zboss_product_config (4 KB)
+#   0xaf000–0xb0fff  settings_storage   (8 KB)
 erase:
-	nrfjprog --eraserange 0xec000 0xf3fff --snr $(shell nrfjprog --com | head -1 | awk '{print $$1}')
+	nrfjprog --eraserange 0xa6000 0xb0fff --snr $(shell nrfjprog --com | head -1 | awk '{print $$1}')
 
 # A pristine rebuild forces CMake to reconfigure from scratch — useful
 # after changing prj.conf, app.overlay, or board Kconfig/DTS.

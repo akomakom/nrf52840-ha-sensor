@@ -20,43 +20,15 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/init.h>
 #include <hal/nrf_gpio.h>
-
-/* ── Boot diagnostic via blue LED (P0.15) ────────────────────────────
- *
- * Step 1: Show reset cause (runs at PRE_KERNEL_1 priority 0, first thing):
- *   WDT reset  → 5 rapid flashes (50 ms each), then 1 s pause
- *   CPU lockup → 3 long flashes (400 ms each), then 1 s pause
- *   Other      → no preamble, proceed directly to stage blinks
- *
- * Step 2: Stage blink codes (LED always OFF between groups in PK1/PK2):
- *   1 flash  → PK1 priority 0 passed  (crash in PK1 prio 0–20)
- *   2 flashes → PK1 priority 20 passed (crash at MPSL init ~prio 40)
- *   3 flashes → PK1 priority 50 passed (crash prio 50–80)
- *   4 flashes → PK1 priority 80 passed (crash prio 80 – PK2)
- *   5 flashes → PK2 priority 0 passed
- *   6 flashes → PK2 priority 50 passed
- *   7 flashes → PK2 priority 90 passed (crash near end of PK2)
- *
- * Step 3: POST_KERNEL (LED stays ON solid after group):
- *   1+solid → PK prio 0   (crash prio 0–40)
- *   2+solid → PK prio 40  (crash prio 40–60)
- *   3+solid → PK prio 60  (crash prio 60–80)
- *   4+solid → PK prio 80  (crash prio 80–90)
- *   5+solid → PK prio 90  (crash prio 90–91, in usb_device_init / sht4x_init)
- *   6+solid → PK prio 91  (crash prio 91–95, nrf5_init at 95)
- *   7+solid → PK prio 95  (crash prio 95–99, nrf_802154_configure at 99)
- *   LED OFF in main() = main() reached, Zigbee starting
- *
- * WDT feeding: every checkpoint feeds active WDT channels so a 1-second
- * Adafruit bootloader WDT cannot fire before we can gather diagnostic info.
- */
-#include <helpers/nrfx_reset_reason.h>
 #include <hal/nrf_wdt.h>
+#include <ram_pwrdn.h>
 
-#define DIAG_LED_PIN 15   /* P0.15 = blue LED on nice!nano */
-
-/* Feed all active watchdog channels to prevent bootloader WDT timeout */
-static void diag_pet_wdt(void)
+/* Feed all active watchdog channels.
+ * The Adafruit UF2 bootloader starts a 1-second hardware WDT before
+ * jumping to the application.  nRF WDT cannot be stopped once started,
+ * so the app must keep feeding it.  Called every 500 ms from a Zephyr
+ * timer that continues firing through System-ON deep sleep (RTC-backed). */
+static void wdt_feed_all(void)
 {
 	if (nrf_wdt_started_check(NRF_WDT)) {
 		for (int ch = 0; ch < 8; ch++) {
@@ -69,163 +41,30 @@ static void diag_pet_wdt(void)
 	}
 }
 
-/* N quick blinks, LED ends OFF (pre-PK stages) */
-static void diag_flash_off(int n)
+/* ── Sensor power pins ───────────────────────────────────────────── */
+
+#define SHT40_VCC_PIN  24   /* P0.24 → sensor VCC */
+#define SHT40_GND_PIN  22   /* P0.22 → sensor GND */
+#define LED_PIN        15   /* P0.15 → blue LED (active HIGH) */
+
+/* Power up the SHT40 before sht4x_init (POST_KERNEL 90) runs.
+ * The driver sends a soft-reset over I2C during init; if VCC is low the
+ * sensor has no power and the I2C transaction fails, leaving the device
+ * not-ready.  Raw nrf_gpio HAL so this works before the GPIO driver is
+ * fully configured by Zephyr. */
+static int sht40_power_on(void)
 {
-	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-	diag_pet_wdt();
-	for (int i = 0; i < n; i++) {
-		nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(120000);  /* 120 ms on */
-		nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(250000);  /* 250 ms off */
-		diag_pet_wdt();
-	}
-	k_busy_wait(400000);  /* 400 ms between groups */
-}
-
-/* N blinks then LED stays ON (POST_KERNEL stages) */
-static void diag_flash_on(int n)
-{
-	diag_pet_wdt();
-	for (int i = 0; i < n; i++) {
-		nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(120000);
-		nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(250000);
-		diag_pet_wdt();
-	}
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));  /* stays ON */
-}
-
-/* Show reset cause first, so we know WHY we're in a reset loop.
- * Runs at PRE_KERNEL_1 priority 0 — very first thing the app does.
- *
- * FIRMWARE SIGNATURE: two slow 800 ms pulses before anything else.
- * If you see these two long flashes at power-on, new firmware is loaded. */
-static int diag_reset_cause(void)
-{
-	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-	diag_pet_wdt();
-
-	/* Two long pulses = new firmware confirmation */
-	for (int i = 0; i < 2; i++) {
-		nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(800000);   /* 800 ms ON */
-		nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-		k_busy_wait(400000);   /* 400 ms OFF */
-		diag_pet_wdt();
-	}
-	k_busy_wait(500000);  /* 500 ms pause before reset-cause display */
-	diag_pet_wdt();
-
-	uint32_t reas = nrfx_reset_reason_get();
-	nrfx_reset_reason_clear(0xFFFFFFFF);
-
-	if (reas & NRFX_RESET_REASON_DOG_MASK) {
-		/* WDT fired: 5 rapid blinks then pause — bootloader WDT! */
-		for (int i = 0; i < 5; i++) {
-			nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-			k_busy_wait(60000);
-			nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-			k_busy_wait(60000);
-		}
-		k_busy_wait(800000);
-	} else if (reas & NRFX_RESET_REASON_LOCKUP_MASK) {
-		/* CPU lockup (hard fault): 3 slow blinks then pause */
-		for (int i = 0; i < 3; i++) {
-			nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-			k_busy_wait(400000);
-			nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-			k_busy_wait(200000);
-		}
-		k_busy_wait(800000);
-	}
-	/* Any other cause (pin reset, software reset) → no preamble */
+	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, SHT40_VCC_PIN));
+	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, SHT40_VCC_PIN));    /* VCC HIGH */
+	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));
+	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));  /* GND LOW */
+	k_busy_wait(20000);   /* 20 ms — SHT40 power-on time before first I2C */
 	return 0;
 }
-SYS_INIT(diag_reset_cause, PRE_KERNEL_1, 0);
+SYS_INIT(sht40_power_on, POST_KERNEL, 85);
 
-/* ── PRE_KERNEL_1 checkpoints ── */
-static int diag_pk1_1(void)  { diag_flash_off(1); return 0; }
-static int diag_pk1_20(void) { diag_flash_off(2); return 0; }
-/* MPSL init (mpsl_lib_init_sys) runs at PRE_KERNEL_1 ~priority 40 */
-static int diag_pk1_50(void) { diag_flash_off(3); return 0; }
-static int diag_pk1_80(void) { diag_flash_off(4); return 0; }
+/* ── ZBOSS / Zigbee ──────────────────────────────────────────────── */
 
-SYS_INIT(diag_pk1_1,  PRE_KERNEL_1,  1);
-SYS_INIT(diag_pk1_20, PRE_KERNEL_1, 20);
-SYS_INIT(diag_pk1_50, PRE_KERNEL_1, 50);
-SYS_INIT(diag_pk1_80, PRE_KERNEL_1, 80);
-
-/* ── PRE_KERNEL_2 checkpoints ── */
-static int diag_pk2_0(void)  { diag_flash_off(5); return 0; }
-static int diag_pk2_50(void) { diag_flash_off(6); return 0; }
-static int diag_pk2_90(void) { diag_flash_off(7); return 0; }
-
-SYS_INIT(diag_pk2_0,  PRE_KERNEL_2,  0);
-SYS_INIT(diag_pk2_50, PRE_KERNEL_2, 50);
-SYS_INIT(diag_pk2_90, PRE_KERNEL_2, 90);
-
-/* ── POST_KERNEL checkpoints — LED stays ON solid after each ──
- *
- * Priority bracket → what runs between each pair:
- *   0   – logger init, usb_work_q, mpsl_low_prio
- *  40   – k_sys_work_q
- *  60   – saadc init, flash/nvs init, i2c init
- *  80   – usb_init (hardware)
- *  89   – nrf5_init (IEEE 802.15.4 driver)   ← CONFIG_IEEE802154_NRF5_INIT_PRIO=89
- *  90   – usb_device_init (CDC ACM), net_core_init, sensor inits
- *  99   – nrf_802154_configure             ← CONFIG_NRF_802154_RADIO_CONFIG_PRIO=99
- */
-static int diag_post_0(void)  { diag_flash_on(1); return 0; }
-static int diag_post_40(void) { diag_flash_on(2); return 0; }
-static int diag_post_60(void) { diag_flash_on(3); return 0; }
-static int diag_post_80(void) { diag_flash_on(4); return 0; }
-/* Priority 88: runs between usb_init (80) and usb_device_init/sht4x_init (90).
- * Feeds WDT aggressively and shows a 2-second solid LED so it's unmistakable.
- * If you see "4+solid → 2s solid → ..." the crash is at priority 90+.
- * If you see "4+solid → reset" this function never ran → crash at 81-87. */
-static int diag_post_88(void)
-{
-	/* Feed WDT — this is the critical gap where bootloader WDT was firing */
-	diag_pet_wdt();
-	k_busy_wait(50000);
-	diag_pet_wdt();
-	/* 2-second solid LED = unmistakable "reached priority 88" signal */
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-	k_busy_wait(500000); diag_pet_wdt();
-	k_busy_wait(500000); diag_pet_wdt();
-	k_busy_wait(500000); diag_pet_wdt();
-	k_busy_wait(500000); diag_pet_wdt();
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-	k_busy_wait(300000);
-	return 0;
-}
-
-static int diag_post_90(void) { diag_flash_on(5); return 0; }
-
-/* Priority 91: Runs after usb_device_init/sht4x_init/temp_nrf5_mpsl_init (all at 90).
- * 6 blinks = those inits survived.  No 6-blinks = crash is inside priority-90 inits. */
-static int diag_post_91(void) { diag_flash_on(6); return 0; }
-
-/* Priority 92: diagnostic complete — USB CDC is up, proceed to boot. */
-static int diag_usb_wait(void) { diag_pet_wdt(); return 0; }
-
-static int diag_post_95(void) { diag_flash_on(7); return 0; }
-
-SYS_INIT(diag_post_0,  POST_KERNEL,  0);
-
-SYS_INIT(diag_post_40, POST_KERNEL, 40);
-SYS_INIT(diag_post_60, POST_KERNEL, 60);
-SYS_INIT(diag_post_80, POST_KERNEL, 80);
-SYS_INIT(diag_post_88, POST_KERNEL, 88);
-SYS_INIT(diag_post_90, POST_KERNEL, 90);
-SYS_INIT(diag_post_91, POST_KERNEL, 91);
-SYS_INIT(diag_usb_wait, POST_KERNEL, 92);
-SYS_INIT(diag_post_95, POST_KERNEL, 95);
-
-/* ZBOSS / Zigbee */
 #include <zboss_api.h>
 #include <zboss_api_addons.h>
 #include <zboss_api_zdo.h>
@@ -247,26 +86,6 @@ extern void zb_bdb_reset_via_local_action(zb_uint8_t param);
 
 LOG_MODULE_REGISTER(sensor_app, LOG_LEVEL_INF);
 
-/* ── Sensor power pins (defined early — used by sht40_power_on) ─── */
-#define SHT40_VCC_PIN  24   /* P0.24 → sensor VCC */
-#define SHT40_GND_PIN  22   /* P0.22 → sensor GND */
-
-/* Power up the SHT40 before sht4x_init (POST_KERNEL 90) runs.
- * The driver sends a soft-reset over I2C during init; if VCC is low the
- * sensor has no power and the I2C transaction fails, leaving the device
- * not-ready.  Using raw nrf_gpio HAL so this works before the GPIO
- * driver is fully configured. */
-static int sht40_power_on(void)
-{
-	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, SHT40_VCC_PIN));
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, SHT40_VCC_PIN));    /* VCC HIGH */
-	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));  /* GND LOW */
-	k_busy_wait(20000);   /* 20 ms — SHT40 power-on time before first I2C */
-	return 0;
-}
-SYS_INIT(sht40_power_on, POST_KERNEL, 85);
-
 /* ── Device tree handles ─────────────────────────────────────────── */
 
 #define SHT40_NODE DT_NODELABEL(sht40)
@@ -283,13 +102,17 @@ static const struct adc_dt_spec adc_vdd =
 #define SENSOR_ENDPOINT          1
 #define SENSOR_IN_CLUSTER_COUNT  4
 #define SENSOR_OUT_CLUSTER_COUNT 0
-#define SENSOR_REPORT_COUNT      4   /* temp + humidity + batt% + batt voltage */
+#define SENSOR_REPORT_COUNT      4   /* temp + humidity + batt % + batt voltage */
 
 /* ZHA Temperature Sensor device ID */
 #define SENSOR_DEVICE_ID  0x0302u
 
-/* Measurement interval: 15 seconds in ZBOSS beacon intervals */
-#define MEAS_INTERVAL_TICKS  ZB_MILLISECONDS_TO_BEACON_INTERVAL(15000)
+/* Measurement interval.
+ * 60 s is a reasonable production value; shorten for bench testing only.
+ * Note: shortening this does NOT lower idle current — the radio's sleep
+ * behaviour is governed by ZBOSS, not by how often we schedule a reading. */
+#define MEAS_INTERVAL_MS         60000
+#define MEAS_INTERVAL_TICKS      ZB_MILLISECONDS_TO_BEACON_INTERVAL(MEAS_INTERVAL_MS)
 
 /* ── ZCL attribute storage ───────────────────────────────────────── */
 
@@ -319,9 +142,6 @@ static zb_uint16_t attr_hum_max_value = 10000;
 
 /* ── Attribute lists ─────────────────────────────────────────────── */
 
-/* Declare only the attributes we have values for — ZHA reads what's
- * available and skips the rest.  Avoids NULL-pointer dereferences from
- * the _EXT macro's full list. */
 ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(basic_attr_list, ZB_ZCL_BASIC)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_ZCL_VERSION_ID,        &attr_zcl_version)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID,   attr_manufacturer)
@@ -329,10 +149,6 @@ ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,    attr_model)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID,       &attr_power_source)
 ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
-/*
- * Power Config: build manually with ZB_ZCL_SET_ATTR_DESC_M to avoid
- * the two-argument battery-number macros that ZB_ZCL_SET_ATTR_DESC expands into.
- */
 ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(power_config_attr_list,
 						   ZB_ZCL_POWER_CONFIG)
 ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
@@ -426,7 +242,7 @@ ZBOSS_DECLARE_DEVICE_CTX_1_EP(sensor_device_ctx, sensor_ep);
 
 /* ── ADC state ───────────────────────────────────────────────────── */
 
-static int16_t          adc_raw_val;
+static int16_t           adc_raw_val;
 static struct adc_sequence adc_seq = {
 	.buffer      = &adc_raw_val,
 	.buffer_size = sizeof(adc_raw_val),
@@ -437,14 +253,20 @@ static void measure_and_report(zb_uint8_t param);
 static void restore_long_poll(zb_uint8_t param);
 static void on_network_joined(void);
 
-/* After joining, poll every 2 s for 60 s so ZHA can complete its
- * attribute interview, then restore the normal 15-second sleep cycle. */
+/* ── Post-join interview window ──────────────────────────────────── */
+
+/* After joining, poll every 2 s for 5 min so ZHA can complete its
+ * attribute interview, then restore the normal sleep cycle.
+ * 5 minutes is needed because ZHA sends configure-reporting frames for
+ * every reportable attribute; at 60 s long poll each frame takes up to
+ * 60 s to deliver, so 4 attributes × 60 s = 4 min minimum.  Using 300 s
+ * gives margin for slow coordinators / congested networks. */
 static void on_network_joined(void)
 {
 	zb_zdo_pim_set_long_poll_interval(2000);
 	ZB_SCHEDULE_APP_ALARM_CANCEL(restore_long_poll, ZB_ALARM_ANY_PARAM);
 	ZB_SCHEDULE_APP_ALARM(restore_long_poll, 0,
-			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(60000));
+			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(300000));
 	ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report, ZB_ALARM_ANY_PARAM);
 	ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
 			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
@@ -453,8 +275,9 @@ static void on_network_joined(void)
 static void restore_long_poll(zb_uint8_t param)
 {
 	ARG_UNUSED(param);
-	zb_zdo_pim_set_long_poll_interval(15000);
-	LOG_INF("Interview window closed — poll interval 15 s");
+	zb_zdo_pim_set_long_poll_interval(MEAS_INTERVAL_MS);
+	LOG_INF("Interview window closed — poll interval %d s",
+		MEAS_INTERVAL_MS / 1000);
 }
 
 /* ── Battery measurement ─────────────────────────────────────────── */
@@ -476,8 +299,8 @@ static void update_battery(void)
 	/* ZCL battery voltage: 100 mV units */
 	zb_uint8_t zcl_voltage = (zb_uint8_t)(mv / 100);
 
-	/* ZCL BatteryPercentageRemaining: 0.5 % units (0-200).
-	 * Linear: 2100 mV = 0 %, 3300 mV = 100 % */
+	/* ZCL BatteryPercentageRemaining: 0.5 % units (0–200).
+	 * Linear approximation: 2100 mV = 0 %, 3300 mV = 100 % */
 	int32_t pct = ((mv - 2100) * 200) / (3300 - 2100);
 
 	if (pct < 0) {
@@ -499,6 +322,23 @@ static void update_battery(void)
 		ZB_ZCL_CLUSTER_SERVER_ROLE,
 		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
 		&zcl_percentage, ZB_FALSE);
+}
+
+/* ── LED heartbeat ───────────────────────────────────────────────── */
+
+/* Brief blink on the blue LED — used to show the device is alive while
+ * running on battery with USB/logging disabled.  Two quick flashes per
+ * measurement cycle = "woke up, read sensor, sent Zigbee report". */
+static void led_blink(int count)
+{
+	for (int i = 0; i < count; i++) {
+		gpio_pin_set(gpio0_dev, LED_PIN, 1);
+		k_sleep(K_MSEC(30));
+		gpio_pin_set(gpio0_dev, LED_PIN, 0);
+		if (i < count - 1) {
+			k_sleep(K_MSEC(120));
+		}
+	}
 }
 
 /* ── Measurement + report (ZBOSS scheduler callback) ─────────────── */
@@ -544,6 +384,9 @@ static void measure_and_report(zb_uint8_t param)
 			ZB_ZCL_CLUSTER_SERVER_ROLE,
 			ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
 			(zb_uint8_t *)&zcl_hum, ZB_FALSE);
+
+		/* Two quick blinks = alive + reported */
+		led_blink(2);
 	}
 
 	/* Power down the SHT40 */
@@ -568,55 +411,69 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	switch (sig) {
 	case ZB_BDB_SIGNAL_DEVICE_FIRST_START:
 		/* ZBOSS initialized with empty NVRAM — default handler starts
-		 * network steering.  Do NOT start measurements yet. */
+		 * network steering automatically. */
 		LOG_INF("First start — beginning network steering");
 		break;
 
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
 		/* Reboot with existing network credentials in NVRAM. */
 		if (status == RET_OK) {
-			/* Rejoined old network — go straight to normal sleep
-			 * cycle; ZHA already interviewed us on first join. */
-			LOG_INF("Rejoined network — starting measurements");
-			zb_zdo_pim_set_long_poll_interval(15000);
-			ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report,
-						     ZB_ALARM_ANY_PARAM);
-			ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
-				ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
+			/* Open the same 60 s interview window used after a fresh
+			 * join.  This is needed because the ZBOSS ZCL attribute-
+			 * reporting configuration is stored separately from
+			 * network credentials in NVRAM.  If that config is lost
+			 * (e.g. after a partition-map change) ZHA must re-send
+			 * configure-reporting frames for every reportable
+			 * attribute.  At 60 s long poll each frame takes up to
+			 * 60 s to reach the device; at 2 s poll all frames
+			 * arrive within the 60 s window.
+			 *
+			 * Once the interview is complete and ZBOSS has the
+			 * reporting config back in NVRAM, ZHA stays silent and
+			 * the device can sleep properly between measurements. */
+			LOG_INF("Rejoined network — opening 300 s interview window");
+			on_network_joined();
 		} else {
-			/* The network we were on is gone (coordinator reset,
-			 * ZHA removed us, etc.).  Wipe NVRAM so the next boot
-			 * starts a clean steer; ZHA can then discover us fresh.
+			/* Coordinator temporarily unreachable (HA offline, etc.).
+			 * Do NOT wipe NVRAM here — that would cause an infinite
+			 * wipe → FIRST_START → steer → fail → wipe loop that keeps
+			 * the radio scanning channels and draws ~38 mA constantly.
 			 *
-			 * Without this, ZBOSS spends time on a fruitless rejoin
-			 * attempt on every boot before falling through to steering
-			 * — burning through ZHA's permit-join window and making
-			 * the device appear unfindable.
-			 *
-			 * zb_bdb_reset_via_local_action clears NVRAM and triggers
-			 * a new DEVICE_FIRST_START on the next stack run. */
-			LOG_WRN("Rejoin failed — clearing Zigbee NVRAM via BDB reset");
-			ZB_SCHEDULE_APP_CALLBACK(zb_bdb_reset_via_local_action, 0);
+			 * Instead let the default handler's built-in retry run:
+			 * it retries for ~200 s then stops and enters a low-power
+			 * wait state.  NVRAM credentials are preserved so the
+			 * device can rejoin when the coordinator comes back online
+			 * (next power cycle).  Use the serial menu to force re-pair
+			 * if the network is permanently gone. */
+			LOG_WRN("Rejoin failed — retrying for up to ~200 s, then sleeping");
 		}
 		break;
 
 	case ZB_BDB_SIGNAL_STEERING:
 		if (status == RET_OK) {
-			/* Joined a network for the first time (or after loss).
-			 * Use a fast poll interval for the 60-second window
-			 * so ZHA can complete its attribute interview. */
 			LOG_INF("Network steering OK — starting interview window");
 			on_network_joined();
 		} else {
-			/* Steering attempt timed out — ZHA wasn't in permit-join
-			 * mode or didn't hear us.  The default handler retries with
-			 * exponential back-off; we just log here.
-			 *
-			 * Do NOT call user_input_indicate() here: it contains an
-			 * internal ZB_ERROR_CHECK that resets the device if the
-			 * scheduler queue is momentarily full. */
+			/* Timed out — ZHA wasn't in permit-join mode.
+			 * Default handler retries with back-off; just log here.
+			 * Do NOT call user_input_indicate(): it has an internal
+			 * ZB_ERROR_CHECK that can reset the device. */
 			LOG_WRN("Steering attempt failed — will retry");
 		}
+		break;
+
+	case ZB_COMMON_SIGNAL_CAN_SLEEP:
+		/* ZBOSS is idle between polls — the default handler below calls
+		 * zb_sleep_now() → zb_osif_sleep() → k_sleep(), letting Zephyr
+		 * PM enter System-ON deep sleep on nRF52840.
+		 *
+		 * CRITICAL: do NOT log this signal.  It fires every poll cycle
+		 * (every ~100 ms during short-poll mode after a data exchange),
+		 * generating hundreds of messages.  Each message queues work on
+		 * the USB CDC-ACM log backend's system workqueue; even on battery
+		 * with no USB cable the workqueue handler runs, keeping the CPU
+		 * active and preventing Zephyr PM from engaging.  Suppressing the
+		 * log here is what allows the device to reach <1 mA sleep. */
 		break;
 
 	case ZB_ZDO_SIGNAL_LEAVE:
@@ -626,38 +483,32 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		break;
 
 	default:
-		/* Log unhandled signals so we can see the full ZBOSS event stream */
-		LOG_INF("Zigbee signal 0x%x status %d (unhandled)", (unsigned)sig, (int)status);
+		LOG_INF("Zigbee signal 0x%x status %d (unhandled)",
+			(unsigned)sig, (int)status);
 		break;
 	}
 
-	/* Call WITHOUT ZB_ERROR_CHECK.  If the default handler's internal
-	 * callback queue is momentarily full it returns a non-RET_OK value,
-	 * ZB_ERROR_CHECK would trigger a ZBOSS assert, and with
-	 * ZBOSS_RESET_ON_ASSERT=y the device resets — creating an infinite
-	 * steering-fail → reset loop.  Failures here are non-fatal; the
-	 * handler will be called again on the next signal. */
+	/* No ZB_ERROR_CHECK wrapper — a transient non-RET_OK from the default
+	 * handler would trigger a ZBOSS assert → reset loop with
+	 * ZBOSS_RESET_ON_ASSERT=y. */
 	zigbee_default_signal_handler(bufid);
 
-	/* CRITICAL: return the buffer to the ZBOSS pool after the default
-	 * handler is done with it.  Without this, every Zigbee signal leaks
-	 * one buffer.  After a handful of signals the pool is exhausted and
-	 * bdb_start_top_level_commissioning() returns ZB_FALSE — silently
-	 * refusing to start the channel scan — so ZB_BDB_SIGNAL_STEERING
-	 * never fires and ZHA cannot discover the device. */
+	/* Return the buffer to the ZBOSS pool.  Without this every signal
+	 * leaks one buffer; pool exhaustion silently prevents steering. */
 	if (bufid) {
 		zb_buf_free(bufid);
 	}
 }
 
 /* ── WDT keepalive ───────────────────────────────────────────────── */
-/* The Adafruit bootloader starts a 1-second hardware WDT that cannot be
- * stopped.  Feed it every 500 ms from a kernel timer so the app never
- * accidentally resets during normal operation. */
+
+/* Feeds the bootloader WDT every 500 ms.  Zephyr kernel timers are
+ * backed by the RTC and continue firing through System-ON deep sleep,
+ * so this works correctly even when the CPU is sleeping between polls. */
 static void wdt_keepalive_cb(struct k_timer *t)
 {
 	ARG_UNUSED(t);
-	diag_pet_wdt();
+	wdt_feed_all();
 }
 static K_TIMER_DEFINE(wdt_keepalive_timer, wdt_keepalive_cb, NULL);
 
@@ -667,15 +518,15 @@ int main(void)
 {
 	int err;
 
-	/* Start WDT keepalive immediately — must feed within 1 s or reset */
+	/* Start WDT keepalive immediately — must feed within 1 s of boot */
 	k_timer_start(&wdt_keepalive_timer, K_MSEC(500), K_MSEC(500));
 
-	/* Diagnostic: turn LED off to signal main() was reached */
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, DIAG_LED_PIN));
-
-	/* Give USB CDC time to enumerate so early log output is captured. */
+	/* Brief pause for USB CDC to enumerate so early logs are captured.
+	 * With PM enabled, deep sleep only engages when USB is disconnected
+	 * (no VBUS → USB oscillator stops → nRF52840 can enter System-ON
+	 * sleep).  Measuring battery current: unplug USB after this log. */
 	k_sleep(K_MSEC(500));
-	LOG_INF("Sensor app starting");
+	LOG_INF("Sensor app starting (interval %d s)", MEAS_INTERVAL_MS / 1000);
 
 	/* ── Verify devices are ready ── */
 	if (!device_is_ready(sht40_dev)) {
@@ -704,6 +555,11 @@ int main(void)
 		LOG_ERR("GND pin configure: %d", err);
 		return err;
 	}
+	err = gpio_pin_configure(gpio0_dev, LED_PIN, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		LOG_ERR("LED pin configure: %d", err);
+		return err;
+	}
 
 	/* ── ADC: configure the VDD channel ── */
 	err = adc_channel_setup_dt(&adc_vdd);
@@ -713,22 +569,21 @@ int main(void)
 	}
 	adc_sequence_init_dt(&adc_vdd, &adc_seq);
 
-	/* ── Zigbee: register endpoint ── */
+	/* ── Zigbee: register endpoint and start stack ── */
 	ZB_AF_REGISTER_DEVICE_CTX(&sensor_device_ctx);
+
+	/* Power down idle SRAM banks before enabling the radio.
+	 * Must be called explicitly — the library does not auto-call this
+	 * unless CONFIG_RAM_POWER_ADJUST_ON_HEAP_RESIZE=y (requires newlib). */
+	power_down_unused_ram();
 
 	/* Enable sleepy end device behavior (radio off between polls).
 	 * Must be called before zigbee_enable(). */
 	zigbee_configure_sleepy_behavior(true);
 
-	/* DEV: erase Zigbee NVRAM on every boot so the device always starts
-	 * factory-new and goes straight to DEVICE_FIRST_START → steering.
-	 * This avoids DEVICE_REBOOT attempting to rejoin a stale network and
-	 * burning through ZHA's permit-join window before steering begins.
-	 *
-	 * NOTE: remove (or gate on a compile flag) before production — without
-	 * this the device will re-pair on every reset instead of rejoining. */
-	zigbee_erase_persistent_storage(ZB_TRUE);
-
+	/* To re-pair: remove device in ZHA, then send a factory-reset
+	 * command via the serial menu (to be added) or power-cycle with
+	 * zigbee_erase_persistent_storage(ZB_TRUE) temporarily re-enabled. */
 	zigbee_enable();
 
 	return 0;

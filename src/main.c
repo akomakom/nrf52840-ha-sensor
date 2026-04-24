@@ -418,6 +418,11 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
 		/* Reboot with existing network credentials in NVRAM. */
 		if (status == RET_OK) {
+			/* Workaround for KRKNWK-8200: disable turbo poll to prevent
+			 * continuous fast polling that keeps radio active (~26 mA).
+			 * Without this, ZBOSS stays in turbo poll mode indefinitely. */
+			zb_zdo_pim_permit_turbo_poll(0);
+			
 			/* Open the same 60 s interview window used after a fresh
 			 * join.  This is needed because the ZBOSS ZCL attribute-
 			 * reporting configuration is stored separately from
@@ -451,6 +456,11 @@ void zboss_signal_handler(zb_bufid_t bufid)
 
 	case ZB_BDB_SIGNAL_STEERING:
 		if (status == RET_OK) {
+			/* Workaround for KRKNWK-8200: disable turbo poll to prevent
+			 * continuous fast polling that keeps radio active (~26 mA).
+			 * Without this, ZBOSS stays in turbo poll mode indefinitely. */
+			zb_zdo_pim_permit_turbo_poll(0);
+			
 			LOG_INF("Network steering OK — starting interview window");
 			on_network_joined();
 		} else {
@@ -467,13 +477,18 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		 * zb_sleep_now() → zb_osif_sleep() → k_sleep(), letting Zephyr
 		 * PM enter System-ON deep sleep on nRF52840.
 		 *
-		 * CRITICAL: do NOT log this signal.  It fires every poll cycle
-		 * (every ~100 ms during short-poll mode after a data exchange),
-		 * generating hundreds of messages.  Each message queues work on
-		 * the USB CDC-ACM log backend's system workqueue; even on battery
-		 * with no USB cable the workqueue handler runs, keeping the CPU
-		 * active and preventing Zephyr PM from engaging.  Suppressing the
-		 * log here is what allows the device to reach <1 mA sleep. */
+		 * Do NOT log this signal - it fires every poll cycle. */
+#ifdef CONFIG_USB_DEVICE_STACK
+		/* DEBUG mode: prevent sleep when USB is connected to keep console active */
+		if ((NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0) {
+			/* USB connected: skip default handler to prevent sleep */
+			if (bufid) {
+				zb_buf_free(bufid);
+			}
+			return;
+		}
+#endif
+		/* Production mode or battery: allow sleep (handled by default handler below) */
 		break;
 
 	case ZB_ZDO_SIGNAL_LEAVE:
@@ -483,8 +498,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		break;
 
 	default:
-		LOG_INF("Zigbee signal 0x%x status %d (unhandled)",
-			(unsigned)sig, (int)status);
+		/* Silently ignore unhandled signals. Logging here would queue work
+		 * on the system workqueue, keeping the CPU awake and preventing
+		 * deep sleep. All important signals are explicitly handled above. */
 		break;
 	}
 
@@ -521,12 +537,22 @@ int main(void)
 	/* Start WDT keepalive immediately — must feed within 1 s of boot */
 	k_timer_start(&wdt_keepalive_timer, K_MSEC(500), K_MSEC(500));
 
-	/* Brief pause for USB CDC to enumerate so early logs are captured.
-	 * With PM enabled, deep sleep only engages when USB is disconnected
-	 * (no VBUS → USB oscillator stops → nRF52840 can enter System-ON
-	 * sleep).  Measuring battery current: unplug USB after this log. */
-	k_sleep(K_MSEC(500));
-	LOG_INF("Sensor app starting (interval %d s)", MEAS_INTERVAL_MS / 1000);
+	/* Check if USB is connected (VBUS present).
+	 * On nRF52840, VBUS detection is via USBREGSTATUS register.
+	 * If USB is connected: wait for CDC enumeration so logs are captured.
+	 * If USB is NOT connected: skip USB init, logging will be minimal/disabled,
+	 * and PM can enter deep sleep immediately for <1mA battery operation. */
+	bool usb_connected = (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+	
+	if (usb_connected) {
+		/* USB connected: wait for CDC enumeration */
+		k_sleep(K_MSEC(500));
+		LOG_INF("Sensor app starting (interval %d s) [USB mode]", MEAS_INTERVAL_MS / 1000);
+	} else {
+		/* Battery mode: minimal delay, logging will be limited */
+		k_sleep(K_MSEC(50));
+		LOG_INF("Sensor app starting (interval %d s) [Battery mode]", MEAS_INTERVAL_MS / 1000);
+	}
 
 	/* ── Verify devices are ready ── */
 	if (!device_is_ready(sht40_dev)) {
@@ -568,6 +594,11 @@ int main(void)
 		return err;
 	}
 	adc_sequence_init_dt(&adc_vdd, &adc_seq);
+
+	/* ── Initial battery reading before Zigbee starts ── */
+	/* This ensures the battery voltage attribute has a real value
+	 * when ZHA queries it during the initial interview window. */
+	update_battery();
 
 	/* ── Zigbee: register endpoint and start stack ── */
 	ZB_AF_REGISTER_DEVICE_CTX(&sensor_device_ctx);

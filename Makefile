@@ -4,8 +4,9 @@
 #  Targets:
 #    make / make build       — compile (output: build/zephyr/zephyr.uf2)
 #    make flash              — build + copy UF2 to board (double-tap reset first)
-#    make flash-debug        — build DEBUG firmware + flash (USB logging, ~2.5mA)
-#    make flash-prod         — build PRODUCTION firmware + flash (<1mA sleep)
+#    make flash-debug        — build DEBUG firmware + flash (USB logging, sleepy end device)
+#    make flash-prod         — build PRODUCTION firmware + flash (battery, sleepy end device)
+#    make flash-hub          — build HUB firmware + flash (USB logging, router/repeater)
 #    make monitor            — open serial monitor (auto-detect port)
 #    make clean              — remove build directory
 #    make pristine           — remove build dir + force full CMake reconfigure
@@ -13,8 +14,9 @@
 #    make help               — show this list
 #
 #  Build Modes:
-#    DEBUG=y                 — USB logging enabled, PM_DEVICE disabled (~2.5mA)
-#    DEBUG=n (default)       — Production mode, PM_DEVICE enabled (<1mA)
+#    MODE=debug              — Sleepy end device, USB logging, PM_DEVICE disabled
+#    MODE=prod (default)     — Sleepy end device, battery optimized, PM_DEVICE enabled
+#    MODE=hub                — Router/repeater, USB logging, always powered
 #
 #  Overrides:
 #    make flash   MOUNT=/media/youruser/NICENANO
@@ -27,8 +29,8 @@ BUILD_DIR := build
 BAUD      := 115200
 VENV      := ~/ncs/.venv
 
-# Build mode: DEBUG=y for USB logging, DEBUG=n for production battery mode
-DEBUG ?= n
+# Build mode: debug (sleepy+USB), prod (sleepy+battery), hub (router+USB)
+MODE ?= prod
 
 UF2 := $(BUILD_DIR)/zephyr/zephyr.uf2
 
@@ -44,23 +46,35 @@ MOUNT ?= $(shell \
 		if [ -d "$$mp" ]; then echo "$$mp"; break; fi; \
 	done)
 
-.PHONY: all build flash flash-debug flash-prod pflash _copy_uf2 monitor clean pristine erase help _set_debug_mode _set_prod_mode
+.PHONY: all build flash flash-debug flash-prod flash-hub pflash _copy_uf2 monitor clean pristine erase help _set_debug_mode _set_prod_mode _set_hub_mode
 
 all: build
 
 # ---- Build Mode Configuration ----------------------------------
 
 _set_debug_mode:
-	@echo "==> Configuring DEBUG mode (USB logging enabled, PM_DEVICE disabled)"
+	@echo "==> Configuring DEBUG mode (sleepy end device, USB logging, PM_DEVICE disabled)"
 	@sed -i 's/^CONFIG_USB_DEVICE_STACK=n/CONFIG_USB_DEVICE_STACK=y/' prj.conf
 	@sed -i 's/^CONFIG_LOG=n/CONFIG_LOG=y/' prj.conf
 	@sed -i 's/^CONFIG_PM_DEVICE=y/# CONFIG_PM_DEVICE=y/' prj.conf
+	@sed -i 's/^CONFIG_ZIGBEE_ROLE_ROUTER=y/# CONFIG_ZIGBEE_ROLE_ROUTER=y/' prj.conf
+	@sed -i 's/^# CONFIG_ZIGBEE_ROLE_END_DEVICE=y/CONFIG_ZIGBEE_ROLE_END_DEVICE=y/' prj.conf
 
 _set_prod_mode:
-	@echo "==> Configuring PRODUCTION mode (battery only, USB/logging disabled)"
+	@echo "==> Configuring PRODUCTION mode (sleepy end device, battery, USB/logging disabled)"
 	@sed -i 's/^CONFIG_USB_DEVICE_STACK=y/CONFIG_USB_DEVICE_STACK=n/' prj.conf
 	@sed -i 's/^CONFIG_LOG=y/CONFIG_LOG=n/' prj.conf
 	@sed -i 's/^# CONFIG_PM_DEVICE=y/CONFIG_PM_DEVICE=y/' prj.conf
+	@sed -i 's/^CONFIG_ZIGBEE_ROLE_ROUTER=y/# CONFIG_ZIGBEE_ROLE_ROUTER=y/' prj.conf
+	@sed -i 's/^# CONFIG_ZIGBEE_ROLE_END_DEVICE=y/CONFIG_ZIGBEE_ROLE_END_DEVICE=y/' prj.conf
+
+_set_hub_mode:
+	@echo "==> Configuring HUB mode (router/repeater, USB logging, always powered)"
+	@sed -i 's/^CONFIG_USB_DEVICE_STACK=n/CONFIG_USB_DEVICE_STACK=y/' prj.conf
+	@sed -i 's/^CONFIG_LOG=n/CONFIG_LOG=y/' prj.conf
+	@sed -i 's/^CONFIG_PM_DEVICE=y/# CONFIG_PM_DEVICE=y/' prj.conf
+	@sed -i 's/^# CONFIG_ZIGBEE_ROLE_ROUTER=y/CONFIG_ZIGBEE_ROLE_ROUTER=y/' prj.conf
+	@sed -i 's/^CONFIG_ZIGBEE_ROLE_END_DEVICE=y/# CONFIG_ZIGBEE_ROLE_END_DEVICE=y/' prj.conf
 
 # ---- Build -----------------------------------------------------
 
@@ -72,8 +86,10 @@ $(VENV):
 	@echo "  source $(VENV)/bin/activate"
 
 build: $(VENV)
-	@if [ "$(DEBUG)" = "y" ]; then \
+	@if [ "$(MODE)" = "debug" ]; then \
 		$(MAKE) --no-print-directory _set_debug_mode; \
+	elif [ "$(MODE)" = "hub" ]; then \
+		$(MAKE) --no-print-directory _set_hub_mode; \
 	else \
 		$(MAKE) --no-print-directory _set_prod_mode; \
 	fi
@@ -81,10 +97,12 @@ build: $(VENV)
 	source $(VENV)/bin/activate && west build -b $(BOARD) -d $(BUILD_DIR)
 	@test -f $(UF2) || { echo "ERROR: build finished but $(UF2) was not produced!"; exit 1; }
 	@echo ""
-	@if [ "$(DEBUG)" = "y" ]; then \
-		echo "✓ DEBUG firmware built (USB logging, ~2.5mA idle)"; \
+	@if [ "$(MODE)" = "debug" ]; then \
+		echo "✓ DEBUG firmware built (sleepy end device, USB logging)"; \
+	elif [ "$(MODE)" = "hub" ]; then \
+		echo "✓ HUB firmware built (router/repeater, USB logging, always powered)"; \
 	else \
-		echo "✓ PRODUCTION firmware built (battery mode, <1mA idle)"; \
+		echo "✓ PRODUCTION firmware built (sleepy end device, battery optimized)"; \
 	fi
 
 # ---- Flash -----------------------------------------------------
@@ -99,10 +117,13 @@ flash: build
 	@$(MAKE) --no-print-directory _copy_uf2
 
 flash-debug:
-	@$(MAKE) --no-print-directory flash DEBUG=y
+	@$(MAKE) --no-print-directory flash MODE=debug
 
 flash-prod:
-	@$(MAKE) --no-print-directory flash DEBUG=n
+	@$(MAKE) --no-print-directory flash MODE=prod
+
+flash-hub:
+	@$(MAKE) --no-print-directory flash MODE=hub
 
 _copy_uf2:
 	@if [ -z "$(MOUNT)" ]; then \
@@ -127,6 +148,7 @@ monitor:
 	fi
 	@echo "Opening $(PORT) at $(BAUD) baud  (Ctrl-A then K to quit)"
 	screen $(PORT) $(BAUD)
+	reset
 
 # ---- Clean / Pristine ------------------------------------------
 

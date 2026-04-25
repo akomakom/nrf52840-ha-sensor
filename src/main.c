@@ -23,6 +23,8 @@
 #include <hal/nrf_wdt.h>
 #include <ram_pwrdn.h>
 
+#include "config.h"
+
 /* Feed all active watchdog channels.
  * The Adafruit UF2 bootloader starts a 1-second hardware WDT before
  * jumping to the application.  nRF WDT cannot be stopped once started,
@@ -58,7 +60,7 @@ static int sht40_power_on(void)
 	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(0, SHT40_VCC_PIN));    /* VCC HIGH */
 	nrf_gpio_cfg_output(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));
 	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(0, SHT40_GND_PIN));  /* GND LOW */
-	k_busy_wait(20000);   /* 20 ms — SHT40 power-on time before first I2C */
+	k_busy_wait(SENSOR_POWERUP_DELAY_MS * 1000);   /* SHT40 power-on time */
 	return 0;
 }
 SYS_INIT(sht40_power_on, POST_KERNEL, 85);
@@ -104,15 +106,14 @@ static const struct adc_dt_spec adc_vdd =
 #define SENSOR_OUT_CLUSTER_COUNT 0
 #define SENSOR_REPORT_COUNT      4   /* temp + humidity + batt % + batt voltage */
 
-/* ZHA Temperature Sensor device ID */
-#define SENSOR_DEVICE_ID  0x0302u
+/* Device ID: Temperature Sensor for both end device and router.
+ * A router can have application endpoints - it doesn't need to be
+ * a pure Range Extender (0x0008). Using 0x0302 allows the router
+ * to both route traffic AND report sensor data. */
+#define SENSOR_DEVICE_ID  0x0302u  /* ZB_HA_TEMPERATURE_SENSOR_DEVICE_ID */
 
-/* Measurement interval.
- * 60 s is a reasonable production value; shorten for bench testing only.
- * Note: shortening this does NOT lower idle current — the radio's sleep
- * behaviour is governed by ZBOSS, not by how often we schedule a reading. */
-#define MEAS_INTERVAL_MS         60000
-#define MEAS_INTERVAL_TICKS      ZB_MILLISECONDS_TO_BEACON_INTERVAL(MEAS_INTERVAL_MS)
+/* Measurement and poll intervals now configured in config.h */
+#define MEAS_INTERVAL_TICKS      ZB_MILLISECONDS_TO_BEACON_INTERVAL(MEASUREMENT_INTERVAL_MS)
 
 /* ── ZCL attribute storage ───────────────────────────────────────── */
 
@@ -263,10 +264,14 @@ static void on_network_joined(void);
  * gives margin for slow coordinators / congested networks. */
 static void on_network_joined(void)
 {
+#ifdef CONFIG_ZIGBEE_ROLE_END_DEVICE
+	/* End device: set up interview window with fast polling */
 	zb_zdo_pim_set_long_poll_interval(2000);
 	ZB_SCHEDULE_APP_ALARM_CANCEL(restore_long_poll, ZB_ALARM_ANY_PARAM);
 	ZB_SCHEDULE_APP_ALARM(restore_long_poll, 0,
 			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(300000));
+#endif
+	/* Schedule first measurement for both end device and router */
 	ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report, ZB_ALARM_ANY_PARAM);
 	ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
 			      ZB_MILLISECONDS_TO_BEACON_INTERVAL(500));
@@ -275,9 +280,9 @@ static void on_network_joined(void)
 static void restore_long_poll(zb_uint8_t param)
 {
 	ARG_UNUSED(param);
-	zb_zdo_pim_set_long_poll_interval(MEAS_INTERVAL_MS);
+	zb_zdo_pim_set_long_poll_interval(POLL_INTERVAL_MS);
 	LOG_INF("Interview window closed — poll interval %d s",
-		MEAS_INTERVAL_MS / 1000);
+		POLL_INTERVAL_MS / 1000);
 }
 
 /* ── Battery measurement ─────────────────────────────────────────── */
@@ -300,8 +305,9 @@ static void update_battery(void)
 	zb_uint8_t zcl_voltage = (zb_uint8_t)(mv / 100);
 
 	/* ZCL BatteryPercentageRemaining: 0.5 % units (0–200).
-	 * Linear approximation: 2100 mV = 0 %, 3300 mV = 100 % */
-	int32_t pct = ((mv - 2100) * 200) / (3300 - 2100);
+	 * Linear approximation using config.h thresholds */
+	int32_t pct = ((mv - BATTERY_VOLTAGE_MIN_MV) * 200) / 
+	              (BATTERY_VOLTAGE_MAX_MV - BATTERY_VOLTAGE_MIN_MV);
 
 	if (pct < 0) {
 		pct = 0;
@@ -404,116 +410,93 @@ static void measure_and_report(zb_uint8_t param)
 
 void zboss_signal_handler(zb_bufid_t bufid)
 {
+#ifdef CONFIG_ZIGBEE_ROLE_ROUTER
+	/* Router mode: handle permit join signal, otherwise use default handler */
+	zb_zdo_app_signal_hdr_t  *hdr = NULL;
+	zb_zdo_app_signal_type_t  sig = zb_get_app_signal(bufid, &hdr);
+	zb_ret_t status = ZB_GET_APP_SIGNAL_STATUS(bufid);
+	
+	switch (sig) {
+	case ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+		/* Router received permit join status - just log it */
+		LOG_INF("Permit join status signal received");
+		break;
+		
+	case ZB_BDB_SIGNAL_STEERING:
+		if (status == RET_OK) {
+			LOG_INF("Router joined - starting measurements");
+			ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report, ZB_ALARM_ANY_PARAM);
+			ZB_SCHEDULE_APP_ALARM(measure_and_report, 0,
+					      ZB_MILLISECONDS_TO_BEACON_INTERVAL(5000));
+		}
+		break;
+		
+	default:
+		break;
+	}
+	
+	ZB_ERROR_CHECK(zigbee_default_signal_handler(bufid));
+	
+	if (bufid) {
+		zb_buf_free(bufid);
+	}
+#else
+	/* End device mode: custom signal handling for sleepy behavior */
 	zb_zdo_app_signal_hdr_t  *hdr    = NULL;
 	zb_zdo_app_signal_type_t  sig    = zb_get_app_signal(bufid, &hdr);
 	zb_ret_t                  status = ZB_GET_APP_SIGNAL_STATUS(bufid);
 
 	switch (sig) {
 	case ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-		/* ZBOSS initialized with empty NVRAM — default handler starts
-		 * network steering automatically. */
-		LOG_INF("First start — beginning network steering");
+		LOG_INF("First start — beginning network steering (end device)");
 		break;
 
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
-		/* Reboot with existing network credentials in NVRAM. */
 		if (status == RET_OK) {
-			/* Workaround for KRKNWK-8200: disable turbo poll to prevent
-			 * continuous fast polling that keeps radio active (~26 mA).
-			 * Without this, ZBOSS stays in turbo poll mode indefinitely. */
 			zb_zdo_pim_permit_turbo_poll(0);
-			
-			/* Open the same 60 s interview window used after a fresh
-			 * join.  This is needed because the ZBOSS ZCL attribute-
-			 * reporting configuration is stored separately from
-			 * network credentials in NVRAM.  If that config is lost
-			 * (e.g. after a partition-map change) ZHA must re-send
-			 * configure-reporting frames for every reportable
-			 * attribute.  At 60 s long poll each frame takes up to
-			 * 60 s to reach the device; at 2 s poll all frames
-			 * arrive within the 60 s window.
-			 *
-			 * Once the interview is complete and ZBOSS has the
-			 * reporting config back in NVRAM, ZHA stays silent and
-			 * the device can sleep properly between measurements. */
 			LOG_INF("Rejoined network — opening 300 s interview window");
 			on_network_joined();
 		} else {
-			/* Coordinator temporarily unreachable (HA offline, etc.).
-			 * Do NOT wipe NVRAM here — that would cause an infinite
-			 * wipe → FIRST_START → steer → fail → wipe loop that keeps
-			 * the radio scanning channels and draws ~38 mA constantly.
-			 *
-			 * Instead let the default handler's built-in retry run:
-			 * it retries for ~200 s then stops and enters a low-power
-			 * wait state.  NVRAM credentials are preserved so the
-			 * device can rejoin when the coordinator comes back online
-			 * (next power cycle).  Use the serial menu to force re-pair
-			 * if the network is permanently gone. */
 			LOG_WRN("Rejoin failed — retrying for up to ~200 s, then sleeping");
 		}
 		break;
 
 	case ZB_BDB_SIGNAL_STEERING:
 		if (status == RET_OK) {
-			/* Workaround for KRKNWK-8200: disable turbo poll to prevent
-			 * continuous fast polling that keeps radio active (~26 mA).
-			 * Without this, ZBOSS stays in turbo poll mode indefinitely. */
 			zb_zdo_pim_permit_turbo_poll(0);
-			
 			LOG_INF("Network steering OK — starting interview window");
 			on_network_joined();
 		} else {
-			/* Timed out — ZHA wasn't in permit-join mode.
-			 * Default handler retries with back-off; just log here.
-			 * Do NOT call user_input_indicate(): it has an internal
-			 * ZB_ERROR_CHECK that can reset the device. */
 			LOG_WRN("Steering attempt failed — will retry");
 		}
 		break;
 
 	case ZB_COMMON_SIGNAL_CAN_SLEEP:
-		/* ZBOSS is idle between polls — the default handler below calls
-		 * zb_sleep_now() → zb_osif_sleep() → k_sleep(), letting Zephyr
-		 * PM enter System-ON deep sleep on nRF52840.
-		 *
-		 * Do NOT log this signal - it fires every poll cycle. */
 #ifdef CONFIG_USB_DEVICE_STACK
-		/* DEBUG mode: prevent sleep when USB is connected to keep console active */
 		if ((NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0) {
-			/* USB connected: skip default handler to prevent sleep */
 			if (bufid) {
 				zb_buf_free(bufid);
 			}
 			return;
 		}
 #endif
-		/* Production mode or battery: allow sleep (handled by default handler below) */
 		break;
 
 	case ZB_ZDO_SIGNAL_LEAVE:
 		LOG_INF("Left Zigbee network");
-		ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report,
-					     ZB_ALARM_ANY_PARAM);
+		ZB_SCHEDULE_APP_ALARM_CANCEL(measure_and_report, ZB_ALARM_ANY_PARAM);
 		break;
 
 	default:
-		/* Silently ignore unhandled signals. Logging here would queue work
-		 * on the system workqueue, keeping the CPU awake and preventing
-		 * deep sleep. All important signals are explicitly handled above. */
 		break;
 	}
 
-	/* No ZB_ERROR_CHECK wrapper — a transient non-RET_OK from the default
-	 * handler would trigger a ZBOSS assert → reset loop with
-	 * ZBOSS_RESET_ON_ASSERT=y. */
 	zigbee_default_signal_handler(bufid);
-
-	/* Return the buffer to the ZBOSS pool.  Without this every signal
-	 * leaks one buffer; pool exhaustion silently prevents steering. */
+	
 	if (bufid) {
 		zb_buf_free(bufid);
 	}
+#endif
 }
 
 /* ── WDT keepalive ───────────────────────────────────────────────── */
@@ -547,11 +530,11 @@ int main(void)
 	if (usb_connected) {
 		/* USB connected: wait for CDC enumeration */
 		k_sleep(K_MSEC(500));
-		LOG_INF("Sensor app starting (interval %d s) [USB mode]", MEAS_INTERVAL_MS / 1000);
+		LOG_INF("Sensor app starting (interval %d s) [USB mode]", MEASUREMENT_INTERVAL_MS / 1000);
 	} else {
 		/* Battery mode: minimal delay, logging will be limited */
 		k_sleep(K_MSEC(50));
-		LOG_INF("Sensor app starting (interval %d s) [Battery mode]", MEAS_INTERVAL_MS / 1000);
+		LOG_INF("Sensor app starting (interval %d s) [Battery mode]", MEASUREMENT_INTERVAL_MS / 1000);
 	}
 
 	/* ── Verify devices are ready ── */
@@ -608,13 +591,23 @@ int main(void)
 	 * unless CONFIG_RAM_POWER_ADJUST_ON_HEAP_RESIZE=y (requires newlib). */
 	power_down_unused_ram();
 
+#ifdef CONFIG_ZIGBEE_ROLE_END_DEVICE
 	/* Enable sleepy end device behavior (radio off between polls).
-	 * Must be called before zigbee_enable(). */
+	 * Must be called before zigbee_enable().
+	 * Routers are always powered and never sleep. */
 	zigbee_configure_sleepy_behavior(true);
+	LOG_INF("Zigbee: sleepy end device mode");
+#else
+	/* Router mode: explicitly set rx-on-when-idle to ensure router behavior.
+	 * This prevents the device from entering sleepy end device mode. */
+	zb_set_rx_on_when_idle(ZB_TRUE);
+	LOG_INF("Zigbee: router mode (always powered, rx-on-when-idle)");
+#endif
 
 	/* To re-pair: remove device in ZHA, then send a factory-reset
 	 * command via the serial menu (to be added) or power-cycle with
 	 * zigbee_erase_persistent_storage(ZB_TRUE) temporarily re-enabled. */
+	zigbee_erase_persistent_storage(ZB_TRUE);
 	zigbee_enable();
 
 	return 0;

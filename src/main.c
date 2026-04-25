@@ -120,8 +120,8 @@ static const struct adc_dt_spec adc_vdd =
 /* Basic cluster */
 static zb_uint8_t attr_zcl_version    = ZB_ZCL_VERSION;
 static zb_uint8_t attr_power_source   = ZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
-static char       attr_manufacturer[] = "DIY";
-static char       attr_model[]        = "TempHumSensor";
+static char       attr_manufacturer[] = DEVICE_MANUFACTURER;
+static char       attr_model[]        = DEVICE_MODEL;
 
 /* Power Config cluster
  *   voltage    : 100 mV units  (30 → 3.0 V)
@@ -448,7 +448,7 @@ void zboss_signal_handler(zb_bufid_t bufid)
 
 	switch (sig) {
 	case ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-		LOG_INF("First start — beginning network steering (end device)");
+		LOG_INF("First start — beginning network steering");
 		break;
 
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
@@ -518,7 +518,8 @@ int main(void)
 	int err;
 
 	/* Start WDT keepalive immediately — must feed within 1 s of boot */
-	k_timer_start(&wdt_keepalive_timer, K_MSEC(500), K_MSEC(500));
+	k_timer_start(&wdt_keepalive_timer, K_MSEC(WATCHDOG_FEED_INTERVAL_MS), 
+	              K_MSEC(WATCHDOG_FEED_INTERVAL_MS));
 
 	/* Check if USB is connected (VBUS present).
 	 * On nRF52840, VBUS detection is via USBREGSTATUS register.
@@ -604,10 +605,11 @@ int main(void)
 	LOG_INF("Zigbee: router mode (always powered, rx-on-when-idle)");
 #endif
 
-	/* To re-pair: remove device in ZHA, then send a factory-reset
-	 * command via the serial menu (to be added) or power-cycle with
-	 * zigbee_erase_persistent_storage(ZB_TRUE) temporarily re-enabled. */
+	/* Erase NVRAM if configured in config.h (for initial pairing/testing)
+	 * Set ERASE_PERSISTENT_STORAGE=0 in config.h for normal operation */
+#if ERASE_PERSISTENT_STORAGE
 	zigbee_erase_persistent_storage(ZB_TRUE);
+#endif
 	zigbee_enable();
 
 	return 0;

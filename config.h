@@ -6,6 +6,14 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+/* ── Device Identity ───────────────────────────────────────────────── */
+
+/* Manufacturer and model name shown in Home Assistant
+ * These appear in ZHA during pairing and in device info
+ * Max length: 32 characters each */
+#define DEVICE_MANUFACTURER     "DIY"
+#define DEVICE_MODEL            "TempHumSensor"
+
 /* ── Measurement & Poll Intervals ──────────────────────────────────── */
 
 /* How often to poll the coordinator for messages (milliseconds)
@@ -25,11 +33,16 @@
  * MIN: voltage at 0% battery (device should sleep/shutdown)
  * MAX: voltage at 100% battery (fully charged)
  * 
- * Common values:
- * - CR2032 coin cell: MIN=2000, MAX=3000
- * - LiPo battery:     MIN=3000, MAX=4200
- * - 2xAAA alkaline:   MIN=2000, MAX=3300 */
-#define BATTERY_VOLTAGE_MIN_MV  2000
+ * IMPORTANT: nice!nano has onboard 3.3V regulator that requires ~3.5V minimum input.
+ * The nRF52840 chip itself can run down to 1.7V, but the board's regulator cannot.
+ * 
+ * Recommended values for different battery types:
+ * - Single LiPo (3.7V nominal):  MIN=3200, MAX=4200 (regulator dropout ~0.3V)
+ * - 2xAAA alkaline (3.0V nominal): MIN=2400, MAX=3200 (marginal, may brownout)
+ * - USB power (5V): Always reads ~3300mV (internal VDD measurement)
+ * 
+ * For LiPo batteries, set MIN=3200 to avoid brownout when battery is "empty" */
+#define BATTERY_VOLTAGE_MIN_MV  2400
 #define BATTERY_VOLTAGE_MAX_MV  3300
 
 /* Battery voltage alarm threshold (millivolts)
@@ -43,6 +56,25 @@
  * SHT40 datasheet specifies 1ms typical, 20ms max
  * Increase if sensor readings are unreliable */
 #define SENSOR_POWERUP_DELAY_MS 20
+
+/* ── Watchdog Configuration ────────────────────────────────────────── */
+
+/* Watchdog feed interval (milliseconds)
+ * Adafruit bootloader starts 1s WDT that cannot be stopped
+ * Must feed more frequently than 1000ms to prevent reset
+ * Recommended: 800ms (safe margin, reduces wake-ups vs 500ms)
+ * Lower values = more wake-ups = higher power consumption */
+#define WATCHDOG_FEED_INTERVAL_MS 800
+
+/* ── Zigbee Network Configuration ──────────────────────────────────── */
+
+/* Erase Zigbee network credentials on boot
+ * 1 = Erase NVRAM (fresh join every boot, for testing/pairing)
+ * 0 = Preserve NVRAM (normal operation, rejoin existing network)
+ * 
+ * IMPORTANT: Set to 1 to reset any existing Zigbee pairing data, then change to 0 and rebuild
+ * to preserve network credentials between reboots */
+#define ERASE_PERSISTENT_STORAGE 0
 
 /* ── Zigbee Network Configuration ──────────────────────────────────── */
 
